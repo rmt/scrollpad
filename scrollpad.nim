@@ -3,7 +3,7 @@
 ## This was mostly generated with OpenAI-codex.
 #
 
-import std/[atomics, os, strformat, strutils, terminal, times]
+import std/[atomics, os, strformat, strutils, terminal, times, sequtils]
 import key
 
 const
@@ -16,10 +16,11 @@ const
   editorFgSeq = "\e[38;5;252m"
   scrollbackBgSeq = "\e[48;5;16m"
   scrollbackFgSeq = "\e[38;5;252m"
+  fillToEOL = "\e[0K"
   ansiReset = "\e[0m"
 
-when not defined(threads):
-  {.fatal: "Compile with --threads:on to use this program.".}
+var
+  showInputHistory* = true  # Feature flag: if true, submitted input appears in scrollback with editor highlighting
 
 type
   EventKind = enum
@@ -215,6 +216,50 @@ proc deleteCurrentChar(e: var Editor) =
     e.lines.delete(e.cursorLine + 1)
   e.setPreferredCol()
 
+# Deletes from cursor to the next word separator (non-alphanumeric),
+# but does NOT delete the separator itself unless starting on a separator,
+# in which case all contiguous separators are deleted.
+proc deleteToNextWordSeparator(e: var Editor) =
+  let line = e.lines[e.cursorLine]
+  var i = e.cursorCol
+  if i < line.len and not line[i].isAlphaNumeric:
+    # Starting on a separator: delete all contiguous separators
+    while i < line.len and not line[i].isAlphaNumeric:
+      inc i
+    if i > e.cursorCol:
+      e.lines[e.cursorLine].delete(e.cursorCol ..< i)
+  else:
+    # Starting on a word: delete up to (not including) next separator
+    while i < line.len and line[i].isAlphaNumeric:
+      inc i
+    if i > e.cursorCol:
+      e.lines[e.cursorLine].delete(e.cursorCol ..< i)
+
+# Deletes from cursor to the previous word separator (non-alphanumeric),
+# or to the start of line. If starting on a separator, deletes all contiguous separators before the cursor.
+proc deleteToPrevWordSeparator(e: var Editor) =
+  let line = e.lines[e.cursorLine]
+  var i = e.cursorCol
+  if i == 0: return
+  var start = i
+  # If starting on a separator, delete all contiguous separators before cursor
+  if i > 0 and not line[i-1].isAlphaNumeric:
+    while start > 0 and not line[start-1].isAlphaNumeric:
+      dec start
+    if start < i:
+      e.lines[e.cursorLine].delete(start ..< i)
+      e.cursorCol = start
+      e.setPreferredCol()
+      return
+  # Otherwise, delete all contiguous word characters before cursor
+  while start > 0 and line[start-1].isAlphaNumeric:
+    dec start
+  if start < i:
+    e.lines[e.cursorLine].delete(start ..< i)
+    e.cursorCol = start
+    e.setPreferredCol()
+
+
 proc clearEditor(e: var Editor) =
   e.lines = @[""]
   e.cursorLine = 0
@@ -297,7 +342,7 @@ proc drawBottomUnlocked(state: var UiState; sequential = false) =
   let baseRow = max(0, state.height - state.bottomHeight)
   let extraPad = max(0, state.bottomHeight - desiredHeight)
   let layoutRow = baseRow + extraPad
-  let greyBlank = editorBgSeq & editorFgSeq & "\e[0K" & ansiReset
+  let greyBlank = editorBgSeq & editorFgSeq & fillToEOL & ansiReset
   lastBottomHeight = state.bottomHeight
 
   if useSequential:
@@ -307,15 +352,13 @@ proc drawBottomUnlocked(state: var UiState; sequential = false) =
     stdout.write(greyBlank)
     stdout.write("\n")
     for i, line in layout.lines:
-      stdout.write(editorBgSeq)
-      stdout.write(editorFgSeq)
+      stdout.write(editorBgSeq & editorFgSeq)
       if i == 0:
         stdout.write("› ")
-        stdout.write(line)
       else:
         stdout.write(editorIndent)
-        stdout.write(line)
-      stdout.write("\e[0K")
+      stdout.write(line)
+      stdout.write(fillToEOL)
       stdout.write(ansiReset)
       stdout.write("\n")
     stdout.write(greyBlank)
@@ -412,6 +455,29 @@ proc appendDisplayUnlocked(state: var UiState; lines: openArray[string]) =
   stdout.flushFile()
   drawBottomUnlocked(state, sequential = true)
 
+proc appendEditorHistoryUnlocked(state: var UiState; lines: openArray[string]) =
+  # Similar to appendDisplayUnlocked but uses editor background/foreground styling
+  if lines.len == 0:
+    return
+  let height = terminalHeight()
+  let width = terminalWidth()
+  let span = max(state.bottomHeight, max(state.stickyHeight, 4))
+  let footerTop = max(0, height - span)
+  clearFooterRegion(footerTop, height, width)
+  setCursorPos(0, footerTop)
+  stdout.write("\n")
+  for line in lines:
+    stdout.write(ansiReset & editorBgSeq & editorFgSeq)
+    if line.len <= width:
+      stdout.write(line)
+    else:
+      stdout.write(line)
+    stdout.write("\e[0K" & ansiReset)
+    stdout.write("\n")
+  stdout.write("\n")
+  stdout.flushFile()
+  drawBottomUnlocked(state, sequential = true)
+
 proc appendDisplay(state: var UiState; lines: openArray[string]) =
   if lines.len == 0:
     return
@@ -420,6 +486,18 @@ proc appendDisplay(state: var UiState; lines: openArray[string]) =
     appendDisplayUnlocked(state, lines)
   finally:
     releaseSpin(termLock)
+
+# helper functions for the editor go here
+
+proc deleteToStartOfLine(e: var Editor) =
+  if e.cursorCol > 0:
+    e.lines[e.cursorLine].delete(0 ..< e.cursorCol)
+    e.cursorCol = 0
+  e.setPreferredCol()
+
+proc deleteToEndOfLine(e: var Editor) =
+  if e.cursorCol < e.lines[e.cursorLine].len:
+    e.lines[e.cursorLine].delete(e.cursorCol ..< e.lines[e.cursorLine].len)
 
 proc handleKey(state: var UiState; key: string) =
   acquireSpin(termLock)
@@ -436,14 +514,38 @@ proc handleKey(state: var UiState; key: string) =
     of "ESC[3~":
       state.editor.deleteCurrentChar()
       state.status = "Delete"
+    of "ESC[3;5~":  # Ctrl-Delete
+      state.editor.deleteToNextWordSeparator()
+      state.status = "Delete to next word separator"
+    of "BS": # Ctrl-Backspace
+      state.editor.deleteToPrevWordSeparator()
+      state.status = "Delete to previous word separator"
+    of "VT": # Ctrl-K
+      state.editor.deleteToEndOfLine()
+      state.status = "Delete to end of line"
+    of "NAK": # Ctrl-U
+      state.editor.deleteToStartOfLine()
+      state.status = "Delete to start of line"
     of "NL", "ESC\n", "ESC\r":
       let payload = state.editor.currentText()
       if payload.len > 0:
         let submitted = payload.splitLines()
+        # Clear editor first so redraw shows fresh prompt immediately.
         state.editor.clearEditor()
         state.stickyHeight = 0
-        state.status = "Submitted text"
-        appendDisplayUnlocked(state, submitted)
+        if showInputHistory:
+          # Build history block: blank pad, each line with proper prompt/indent, blank pad.
+          var historyLines: seq[string] = @[]
+          historyLines.add("")
+          for i, ln in submitted:
+            let prefix = if i == 0: "› " else: editorIndent
+            historyLines.add(prefix & ln)
+          historyLines.add("")
+          appendEditorHistoryUnlocked(state, historyLines)
+          state.status = "Submitted text (history enabled)"
+        else:
+          appendDisplayUnlocked(state, submitted)
+          state.status = "Submitted text"
         needsRedraw = false
       else:
         state.status = "Nothing to submit"
