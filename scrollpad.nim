@@ -3,7 +3,7 @@
 ## This was mostly generated with OpenAI-codex.
 #
 
-import std/[atomics, os, strformat, strutils, terminal, times, sequtils]
+import std/[atomics, os, strformat, strutils, terminal, times]
 import key
 
 const
@@ -14,6 +14,7 @@ const
   feedSleepSliceMs = 40
   editorBgSeq = "\e[48;5;235m"
   editorFgSeq = "\e[38;5;252m"
+  editorHistoryBgSeq = "\e[48;5;233m" # Even darker than editorBgSeq, but not black
   scrollbackBgSeq = "\e[48;5;16m"
   scrollbackFgSeq = "\e[38;5;252m"
   fillToEOL = "\e[0K"
@@ -61,6 +62,8 @@ type
     bottomHeight: int
     running: bool
     stickyHeight: int
+    inputHistory: seq[string]   # Stores up to 500 previous input strings
+    inputHistoryIndex: int      # -1 means not browsing history
 
 var
   termLock: SpinLock
@@ -98,8 +101,15 @@ proc initEditor(): Editor =
   result.cursorCol = 0
   result.preferredCol = 0
 
+
 proc setPreferredCol(e: var Editor) =
   e.preferredCol = e.cursorCol
+
+proc resetEditorToText(e: var Editor, text: string) =
+  e.lines = text.splitLines()
+  e.cursorLine = e.lines.len - 1
+  e.cursorCol = if e.lines.len > 0: e.lines[^1].len else: 0
+  e.setPreferredCol()
 
 proc moveLeft(e: var Editor) =
   if e.cursorCol > 0:
@@ -334,7 +344,6 @@ proc prepareBottom(state: var UiState): tuple[layout: EditorLayout, desiredHeigh
   state.bottomHeight = max(result.desiredHeight, effectiveSticky)
 
 proc drawBottomUnlocked(state: var UiState; sequential = false) =
-  let prevHeight = state.bottomHeight
   let bottomInfo = prepareBottom(state)
   let layout = bottomInfo.layout
   let desiredHeight = bottomInfo.desiredHeight
@@ -467,7 +476,7 @@ proc appendEditorHistoryUnlocked(state: var UiState; lines: openArray[string]) =
   setCursorPos(0, footerTop)
   stdout.write("\n")
   for line in lines:
-    stdout.write(ansiReset & editorBgSeq & editorFgSeq)
+    stdout.write(ansiReset & editorHistoryBgSeq & editorFgSeq)
     if line.len <= width:
       stdout.write(line)
     else:
@@ -530,6 +539,12 @@ proc handleKey(state: var UiState; key: string) =
       let payload = state.editor.currentText()
       if payload.len > 0:
         let submitted = payload.splitLines()
+        # Add to input history, avoid duplicates in a row
+        if state.inputHistory.len == 0 or state.inputHistory[^1] != payload:
+          state.inputHistory.add(payload)
+          if state.inputHistory.len > 500:
+            state.inputHistory.delete(0)
+        state.inputHistoryIndex = -1
         # Clear editor first so redraw shows fresh prompt immediately.
         state.editor.clearEditor()
         state.stickyHeight = 0
@@ -549,6 +564,24 @@ proc handleKey(state: var UiState; key: string) =
         needsRedraw = false
       else:
         state.status = "Nothing to submit"
+    of "ESC[5~": # PageUp - previous input
+      if state.inputHistory.len > 0:
+        if state.inputHistoryIndex == -1:
+          state.inputHistoryIndex = state.inputHistory.len - 1
+        elif state.inputHistoryIndex > 0:
+          dec state.inputHistoryIndex
+        state.editor.resetEditorToText(state.inputHistory[state.inputHistoryIndex])
+        state.status = "Recalled previous input"
+    of "ESC[6~": # PageDown - next input
+      if state.inputHistory.len > 0 and state.inputHistoryIndex != -1:
+        if state.inputHistoryIndex < state.inputHistory.len - 1:
+          inc state.inputHistoryIndex
+          state.editor.resetEditorToText(state.inputHistory[state.inputHistoryIndex])
+          state.status = "Recalled next input"
+        else:
+          state.inputHistoryIndex = -1
+          state.editor.clearEditor()
+          state.status = "Input cleared"
     of "ESC[H", "SOH":
       state.editor.moveHome()
       state.status = "Home"
