@@ -1,2 +1,5 @@
 scrollpad: scrollpad.nim
-	nim c -d:threads --nimcache:./tmp_nimcache scrollpad.nim
+	nim c scrollpad.nim
+
+example: example.nim scrollpad.nim
+	nim c example.nim

@@ -12,6 +12,8 @@ type
 
   StatusBar = ref object
     text: string
+    bgColor = bgBlack
+    fgColor = fgWhite
 
   EditBar = ref object
     prompt: string
@@ -49,9 +51,9 @@ proc draw(tv: TextView; row, height, width: int) =
 
 proc draw(s: StatusBar; w: Window, row, width: int) =
   setCursorPos(0, row)
-  stdout.styledWriteLine(bgRed, ' '.repeat width)
+  stdout.styledWriteLine(s.bgColor, ' '.repeat width)
   setCursorPos(0, row)
-  stdout.styledWriteLine(bgRed, "[" & $w.editBar.pos & "] " & s.text)
+  stdout.styledWriteLine(s.bgColor, "[" & $w.editBar.pos & "] " & s.text)
 
 proc draw(s: EditBar; row, width: int) =
   setCursorPos(0, row)

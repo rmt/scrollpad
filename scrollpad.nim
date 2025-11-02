@@ -1,27 +1,13 @@
 #
-## A scrollable TUI like OpenAI-codex, but in nim
-## This was mostly generated with OpenAI-codex.
-#
+## A scrollable TUI very similar to OpenAI-codex.
+##
+## This is designed to be included in your main module.
+## If you have background threads, then you should call
+## scrollpad.isScrollpadRunning() to determine
+## if the scrollpad thread is still running.
 
-import std/[atomics, os, strformat, strutils, terminal, times]
+import std/[atomics, os, strutils, terminal, times]
 import key
-
-const
-  editorIndent = "  "
-  keyPollIntervalMs = 12
-  resizePollIntervalMs = 100
-  feedIntervalMs = 800
-  feedSleepSliceMs = 40
-  editorBgSeq = "\e[48;5;235m"
-  editorFgSeq = "\e[38;5;252m"
-  editorHistoryBgSeq = "\e[48;5;233m" # Even darker than editorBgSeq, but not black
-  scrollbackBgSeq = "\e[48;5;16m"
-  scrollbackFgSeq = "\e[38;5;252m"
-  fillToEOL = "\e[0K"
-  ansiReset = "\e[0m"
-
-var
-  showInputHistory* = true  # Feature flag: if true, submitted input appears in scrollback with editor highlighting
 
 type
   EventKind = enum
@@ -45,6 +31,8 @@ type
     cursorLine: int
     cursorCol: int
     preferredCol: int
+    inputHistory: seq[string] # Stores up to 500 previous input strings
+    inputHistoryIndex: int    # -1 means not browsing history
 
   EditorLayout = object
     lines: seq[string]
@@ -54,23 +42,48 @@ type
   SpinLock = object
     state: Atomic[int32]
 
-  UiState = object
+  SubmitCallback* = proc(text: string) {.nimcall.}
+
+  ThreadEntry = ref object
+    thr: Thread[void]
+
+  Scrollpad = object
     width: int
     height: int
     status: string
+    debugStatus: string
     editor: Editor
     bottomHeight: int
-    running: bool
     stickyHeight: int
-    inputHistory: seq[string]   # Stores up to 500 previous input strings
-    inputHistoryIndex: int      # -1 means not browsing history
+    submitCallback: SubmitCallback
+    threads: seq[ThreadEntry]
+
+const
+  keyPollIntervalMs = 12
+  resizePollIntervalMs = 100
+  fillToEOL = "\e[0K"
+  ansiReset = "\e[0m"
 
 var
+  editorColorSeq* = "\e[48;5;235m\e[38;5;252m" ## dark grey bg + white fg for editor
+  editorHistoryColorSeq* = "\e[48;5;233m\e[38;5;252m" ## very dark gray bg + white fg for editor history
+  scrollbackColorSeq* = "\e[48;5;16m\e[38;5;252m" ## normal scrollback bg + fg color
+  errorColorSeq* = "\e[48;5;52m\e[38;5;15m" ## dark red with white foreground
+  editorPrompt* = "› "                    ## first-line prompt
+  editorPrompt2* = "  "                     ## second-line prompt
+  editorPromptLen* = 2                      ## display length of editorPrompt & editorPrompt2
+
+  showInputHistory* = true ## should submitted input appear in scrollback with highlighting
+  shouldEscapeStop* = true ## should pressing the escape key call stopScrollpad() to quit?
   termLock: SpinLock
   eventCh: Channel[UiEvent]
   running: Atomic[bool]
   lastBottomHeight: int = 4
+  pad: Scrollpad
 
+#
+# SpinLock primitives
+#
 proc initSpinLock(lock: var SpinLock) =
   lock.state.store(0)
 
@@ -84,6 +97,9 @@ proc acquireSpin(lock: var SpinLock) =
 proc releaseSpin(lock: var SpinLock) =
   lock.state.store(0'i32)
 
+#
+# post and pop events to/from the event channel
+#
 proc postEvent(event: UiEvent) =
   var msg = event
   eventCh.send(msg)
@@ -95,12 +111,16 @@ proc tryPopEvent(event: var UiEvent): bool =
     return true
   false
 
+#
+# editor related procs
+#
 proc initEditor(): Editor =
   result.lines = @[""]
   result.cursorLine = 0
   result.cursorCol = 0
   result.preferredCol = 0
-
+  result.inputHistory = @[]
+  result.inputHistoryIndex = -1
 
 proc setPreferredCol(e: var Editor) =
   e.preferredCol = e.cursorCol
@@ -151,6 +171,7 @@ proc isWordBoundary(ch: char): bool =
   ch in {' ', '\t', '/', '\\', '-', '[', ']', '(', ')', '{', '}', '.', ','}
 
 proc moveLeftWord(e: var Editor) =
+  ## move cursor one word to the left
   if e.cursorCol == 0 and e.cursorLine == 0:
     return
   if e.cursorCol == 0:
@@ -160,29 +181,35 @@ proc moveLeftWord(e: var Editor) =
     e.setPreferredCol()
     return
   dec e.cursorCol
-  while e.cursorCol > 0 and not isWordBoundary(e.lines[e.cursorLine][e.cursorCol - 1]):
+  while e.cursorCol > 0 and not isWordBoundary(e.lines[e.cursorLine][
+      e.cursorCol - 1]):
     dec e.cursorCol
   e.setPreferredCol()
 
 proc moveRightWord(e: var Editor) =
+  ## move cursor one word to the right
   let maxLine = e.lines[e.cursorLine].len
   if e.cursorCol == maxLine:
     if e.cursorLine == e.lines.len - 1:
       return
     inc e.cursorLine
     e.cursorCol = 0
-    while e.cursorCol < e.lines[e.cursorLine].len and isWordBoundary(e.lines[e.cursorLine][e.cursorCol]):
+    while e.cursorCol < e.lines[e.cursorLine].len and isWordBoundary(e.lines[
+        e.cursorLine][e.cursorCol]):
       inc e.cursorCol
     e.setPreferredCol()
     return
   inc e.cursorCol
-  while e.cursorCol < e.lines[e.cursorLine].len and not isWordBoundary(e.lines[e.cursorLine][e.cursorCol]):
+  while e.cursorCol < e.lines[e.cursorLine].len and not isWordBoundary(e.lines[
+      e.cursorLine][e.cursorCol]):
     inc e.cursorCol
-  while e.cursorCol < e.lines[e.cursorLine].len and isWordBoundary(e.lines[e.cursorLine][e.cursorCol]):
+  while e.cursorCol < e.lines[e.cursorLine].len and isWordBoundary(e.lines[
+      e.cursorLine][e.cursorCol]):
     inc e.cursorCol
   e.setPreferredCol()
 
 proc insertText(e: var Editor; text: string) =
+  ## insert text at the current cursor position
   if text.len == 0:
     return
   let lineIdx = e.cursorLine
@@ -226,10 +253,10 @@ proc deleteCurrentChar(e: var Editor) =
     e.lines.delete(e.cursorLine + 1)
   e.setPreferredCol()
 
-# Deletes from cursor to the next word separator (non-alphanumeric),
-# but does NOT delete the separator itself unless starting on a separator,
-# in which case all contiguous separators are deleted.
 proc deleteToNextWordSeparator(e: var Editor) =
+  ## Deletes from cursor to the next word separator (non-alphanumeric),
+  ## but does NOT delete the separator itself unless starting on a separator,
+  ## in which case all contiguous separators are deleted.
   let line = e.lines[e.cursorLine]
   var i = e.cursorCol
   if i < line.len and not line[i].isAlphaNumeric:
@@ -245,9 +272,9 @@ proc deleteToNextWordSeparator(e: var Editor) =
     if i > e.cursorCol:
       e.lines[e.cursorLine].delete(e.cursorCol ..< i)
 
-# Deletes from cursor to the previous word separator (non-alphanumeric),
-# or to the start of line. If starting on a separator, deletes all contiguous separators before the cursor.
 proc deleteToPrevWordSeparator(e: var Editor) =
+  ## Deletes from cursor to the previous word separator (non-alphanumeric),
+  ## or to the start of line. If starting on a separator, deletes all contiguous separators before the cursor.
   let line = e.lines[e.cursorLine]
   var i = e.cursorCol
   if i == 0: return
@@ -269,7 +296,6 @@ proc deleteToPrevWordSeparator(e: var Editor) =
     e.cursorCol = start
     e.setPreferredCol()
 
-
 proc clearEditor(e: var Editor) =
   e.lines = @[""]
   e.cursorLine = 0
@@ -278,6 +304,23 @@ proc clearEditor(e: var Editor) =
 
 proc currentText(e: Editor): string =
   result = e.lines.join("\n")
+
+proc previousInputHistory(e: var Editor) =
+  if e.inputHistory.len > 0:
+    if e.inputHistoryIndex == -1:
+      e.inputHistoryIndex = e.inputHistory.len - 1
+    elif e.inputHistoryIndex > 0:
+      dec e.inputHistoryIndex
+    e.resetEditorToText(e.inputHistory[e.inputHistoryIndex])
+
+proc nextInputHistory(e: var Editor) =
+  if e.inputHistory.len > 0 and e.inputHistoryIndex != -1:
+    if e.inputHistoryIndex < e.inputHistory.len - 1:
+      inc e.inputHistoryIndex
+      e.resetEditorToText(e.inputHistory[e.inputHistoryIndex])
+    else:
+      e.inputHistoryIndex = -1
+      e.clearEditor()
 
 proc wrapLine(line: string; width: int): seq[Segment] =
   let effectiveWidth = max(width, 1)
@@ -325,34 +368,35 @@ proc computeLayout(e: Editor; contentWidth: int): EditorLayout =
 proc bottomPadding(layout: EditorLayout): int =
   layout.lines.len + 3
 
-proc prepareBottom(state: var UiState): tuple[layout: EditorLayout, desiredHeight: int] =
-  state.width = terminalWidth()
-  state.height = terminalHeight()
-  let contentWidth = max(1, state.width - editorIndent.len)
-  result.layout = computeLayout(state.editor, contentWidth)
+proc prepareBottom(pad: var Scrollpad): tuple[layout: EditorLayout,
+    desiredHeight: int] =
+  pad.width = terminalWidth()
+  pad.height = terminalHeight()
+  let contentWidth = max(1, pad.width - editorPromptLen)
+  result.layout = computeLayout(pad.editor, contentWidth)
   result.desiredHeight = bottomPadding(result.layout)
 
-  if state.editor.lines.len == 1 and state.editor.lines[0].len == 0:
-    if state.stickyHeight == 0:
-      state.stickyHeight = result.desiredHeight
+  if pad.editor.lines.len == 1 and pad.editor.lines[0].len == 0:
+    if pad.stickyHeight == 0:
+      pad.stickyHeight = result.desiredHeight
   else:
-    if result.desiredHeight > state.stickyHeight:
-      state.stickyHeight = result.desiredHeight
+    if result.desiredHeight > pad.stickyHeight:
+      pad.stickyHeight = result.desiredHeight
 
   let effectiveSticky =
-    if state.stickyHeight == 0: result.desiredHeight else: state.stickyHeight
-  state.bottomHeight = max(result.desiredHeight, effectiveSticky)
+    if pad.stickyHeight == 0: result.desiredHeight else: pad.stickyHeight
+  pad.bottomHeight = max(result.desiredHeight, effectiveSticky)
 
-proc drawBottomUnlocked(state: var UiState; sequential = false) =
-  let bottomInfo = prepareBottom(state)
+proc drawBottomUnlocked(pad: var Scrollpad; sequential = false) =
+  let bottomInfo = prepareBottom(pad)
   let layout = bottomInfo.layout
   let desiredHeight = bottomInfo.desiredHeight
   let useSequential = sequential
-  let baseRow = max(0, state.height - state.bottomHeight)
-  let extraPad = max(0, state.bottomHeight - desiredHeight)
+  let baseRow = max(0, pad.height - pad.bottomHeight)
+  let extraPad = max(0, pad.bottomHeight - desiredHeight)
   let layoutRow = baseRow + extraPad
-  let greyBlank = editorBgSeq & editorFgSeq & fillToEOL & ansiReset
-  lastBottomHeight = state.bottomHeight
+  let greyBlank = editorColorSeq & fillToEOL & ansiReset
+  lastBottomHeight = pad.bottomHeight
 
   if useSequential:
     for _ in 0 ..< extraPad:
@@ -361,26 +405,29 @@ proc drawBottomUnlocked(state: var UiState; sequential = false) =
     stdout.write(greyBlank)
     stdout.write("\n")
     for i, line in layout.lines:
-      stdout.write(editorBgSeq & editorFgSeq)
+      stdout.write(editorColorSeq)
       if i == 0:
-        stdout.write("› ")
+        stdout.write(editorPrompt)
       else:
-        stdout.write(editorIndent)
+        # write spaces matching the prompt length so wrapped lines align
+        stdout.write(editorPrompt2)
       stdout.write(line)
       stdout.write(fillToEOL)
       stdout.write(ansiReset)
       stdout.write("\n")
     stdout.write(greyBlank)
     stdout.write("\n")
-    var statusText = if state.status.len == 0: "Ready" else: state.status
-    if statusText.len > state.width:
-      statusText = statusText[0 ..< state.width]
+    var statusText = pad.status
+    if statusText == "":
+      statusText = pad.debugStatus
+    if statusText.len > pad.width:
+      statusText = statusText[0 ..< pad.width]
     stdout.write("\e[0m\e[48;5;16m\e[38;5;238m")
     stdout.write(statusText)
     stdout.write("\e[0K")
     stdout.write(ansiReset)
   else:
-    for idx in 0 ..< state.bottomHeight:
+    for idx in 0 ..< pad.bottomHeight:
       setCursorPos(0, baseRow + idx)
       eraseLine()
 
@@ -393,13 +440,13 @@ proc drawBottomUnlocked(state: var UiState; sequential = false) =
 
     for i, line in layout.lines:
       setCursorPos(0, layoutRow + 1 + i)
-      stdout.write(editorBgSeq)
-      stdout.write(editorFgSeq)
+      stdout.write(editorColorSeq)
       if i == 0:
-        stdout.write("› ")
+        stdout.write(editorPrompt)
         stdout.write(line)
       else:
-        stdout.write(editorIndent)
+        # show the editor prompt2 on wrapped lines
+        stdout.write(editorPrompt2)
         stdout.write(line)
       stdout.write("\e[0K")
       stdout.write(ansiReset)
@@ -408,9 +455,11 @@ proc drawBottomUnlocked(state: var UiState; sequential = false) =
     stdout.write(greyBlank)
 
     setCursorPos(0, layoutRow + 2 + layout.lines.len)
-    var statusText = if state.status.len == 0: "Ready" else: state.status
-    if statusText.len > state.width:
-      statusText = statusText[0 ..< state.width]
+    var statusText = pad.status
+    if statusText == "":
+      statusText = pad.debugStatus
+    if statusText.len > pad.width:
+      statusText = statusText[0 ..< pad.width]
     stdout.write("\e[0m\e[48;5;16m\e[38;5;238m")
     stdout.write(statusText)
     stdout.write("\e[0K")
@@ -418,15 +467,16 @@ proc drawBottomUnlocked(state: var UiState; sequential = false) =
 
   let cursorRow = layoutRow + 1 + layout.cursorRow
   let cursorCol =
-    if layout.cursorRow == 0: min(state.width - 1, 2 + layout.cursorCol)
-    else: min(state.width - 1, editorIndent.len + layout.cursorCol)
+    if layout.cursorRow == 0: min(pad.width - 1, editorPromptLen +
+        layout.cursorCol)
+    else: min(pad.width - 1, editorPromptLen + layout.cursorCol)
   setCursorPos(cursorCol, cursorRow)
   stdout.flushFile()
 
-proc drawBottom(state: var UiState) =
+proc drawBottom(pad: var Scrollpad) =
   acquireSpin(termLock)
   try:
-    drawBottomUnlocked(state)
+    drawBottomUnlocked(pad)
   finally:
     releaseSpin(termLock)
 
@@ -434,65 +484,60 @@ proc clearFooterRegion(baseRow, height, width: int) =
   for row in baseRow ..< height:
     setCursorPos(0, row)
     stdout.write(ansiReset)
-    stdout.write(scrollbackBgSeq)
-    stdout.write(scrollbackFgSeq)
-    stdout.write("\e[0K")
-    stdout.write(ansiReset)
+    stdout.write(fillToEOL)
 
-proc appendDisplayUnlocked(state: var UiState; lines: openArray[string]) =
+proc appendDisplayUnlocked(pad: var Scrollpad; lines: openArray[string]) =
   if lines.len == 0:
     return
   let height = terminalHeight()
   let width = terminalWidth()
-  let span = max(state.bottomHeight, max(state.stickyHeight, 4))
+  let span = max(pad.bottomHeight, max(pad.stickyHeight, 4))
   let footerTop = max(0, height - span)
   clearFooterRegion(footerTop, height, width)
   setCursorPos(0, footerTop)
   for line in lines:
     stdout.write(ansiReset)
-    stdout.write(scrollbackBgSeq)
-    stdout.write(scrollbackFgSeq)
+    stdout.write(scrollbackColorSeq)
     if line.len <= width:
       stdout.write(line)
       if line.len < width:
-        stdout.write("\e[0K")
-        #stdout.write(' '.repeat(width - line.len))
+        stdout.write(fillToEOL)
     else:
       stdout.write(line)
     stdout.write(ansiReset)
     stdout.write("\n")
   stdout.flushFile()
-  drawBottomUnlocked(state, sequential = true)
+  drawBottomUnlocked(pad, sequential = true)
 
-proc appendEditorHistoryUnlocked(state: var UiState; lines: openArray[string]) =
+proc appendEditorHistoryUnlocked(pad: var Scrollpad; lines: openArray[string]) =
   # Similar to appendDisplayUnlocked but uses editor background/foreground styling
   if lines.len == 0:
     return
   let height = terminalHeight()
   let width = terminalWidth()
-  let span = max(state.bottomHeight, max(state.stickyHeight, 4))
+  let span = max(pad.bottomHeight, max(pad.stickyHeight, 4))
   let footerTop = max(0, height - span)
   clearFooterRegion(footerTop, height, width)
   setCursorPos(0, footerTop)
-  stdout.write("\n")
+  stdout.write(ansiReset & fillToEOL & "\n")
   for line in lines:
-    stdout.write(ansiReset & editorHistoryBgSeq & editorFgSeq)
+    stdout.write(ansiReset & editorHistoryColorSeq)
     if line.len <= width:
       stdout.write(line)
     else:
       stdout.write(line)
     stdout.write("\e[0K" & ansiReset)
     stdout.write("\n")
-  stdout.write("\n")
+  stdout.write(ansiReset & fillToEOL & "\n")
   stdout.flushFile()
-  drawBottomUnlocked(state, sequential = true)
+  drawBottomUnlocked(pad, sequential = true)
 
-proc appendDisplay(state: var UiState; lines: openArray[string]) =
+proc appendDisplay(pad: var Scrollpad; lines: openArray[string]) =
   if lines.len == 0:
     return
   acquireSpin(termLock)
   try:
-    appendDisplayUnlocked(state, lines)
+    appendDisplayUnlocked(pad, lines)
   finally:
     releaseSpin(termLock)
 
@@ -508,115 +553,125 @@ proc deleteToEndOfLine(e: var Editor) =
   if e.cursorCol < e.lines[e.cursorLine].len:
     e.lines[e.cursorLine].delete(e.cursorCol ..< e.lines[e.cursorLine].len)
 
-proc handleKey(state: var UiState; key: string) =
+proc submitInput(pad: var Scrollpad) =
+  let payload = pad.editor.currentText()
+  if payload.len > 0:
+    let submitted = payload.splitLines()
+    # Add to input history, avoid duplicates in a row
+    if pad.editor.inputHistory.len == 0 or pad.editor.inputHistory[^1] != payload:
+      pad.editor.inputHistory.add(payload)
+      if pad.editor.inputHistory.len > 500:
+        pad.editor.inputHistory.delete(0)
+    pad.editor.inputHistoryIndex = -1
+    # Call submitCallback if configured
+    {.gcsafe.}:
+      if not isNil(pad.submitCallback):
+        pad.submitCallback(payload)
+    # Clear editor first so redraw shows fresh prompt immediately.
+    pad.editor.clearEditor()
+    pad.stickyHeight = 0
+    if showInputHistory:
+      # Build history block: blank pad, each submitted line wrapped to the
+      # same content width the editor uses and prefixed with editorPrompt for
+      # the first visual row and editorPrompt2 for wrapped continuation rows.
+      pad.width = terminalWidth()
+      let contentWidth = max(1, pad.width - editorPromptLen)
+      var historyLines: seq[string] = @[]
+      historyLines.add("")
+      for ln in submitted:
+        let segments = wrapLine(ln, contentWidth)
+        for j, seg in segments:
+          let sliceStart = seg.start
+          let sliceEnd = min(seg.start + seg.len, ln.len)
+          let segText = if sliceStart >= sliceEnd: "" else: ln[sliceStart ..< sliceEnd]
+          let prefix = if j == 0: editorPrompt else: editorPrompt2
+          historyLines.add(prefix & segText)
+      historyLines.add("")
+      appendEditorHistoryUnlocked(pad, historyLines)
+      pad.debugStatus = "Submitted text (history enabled)"
+    else:
+      appendDisplayUnlocked(pad, submitted)
+      pad.debugStatus = "Submitted text"
+  else:
+    pad.debugStatus = "Nothing to submit"
+
+proc handleKey(pad: var Scrollpad; key: string) =
+  ## handleKey is called by the mainloop to process new keystroke events
+  ## generated by the keyLoop thread
   acquireSpin(termLock)
   try:
     var needsRedraw = true
     case key
     of "ESC":
-      state.running = false
-      running.store(false)
+      if shouldEscapeStop:
+        running.store(false)
       return
     of "DEL":
-      state.editor.deletePrevChar()
-      state.status = "Backspace"
+      pad.editor.deletePrevChar()
+      pad.debugStatus = "Backspace"
     of "ESC[3~":
-      state.editor.deleteCurrentChar()
-      state.status = "Delete"
-    of "ESC[3;5~":  # Ctrl-Delete
-      state.editor.deleteToNextWordSeparator()
-      state.status = "Delete to next word separator"
+      pad.editor.deleteCurrentChar()
+      pad.debugStatus = "Delete"
+    of "ESC[3;5~": # Ctrl-Delete
+      pad.editor.deleteToNextWordSeparator()
+      pad.debugStatus = "Delete to next word separator"
     of "BS": # Ctrl-Backspace
-      state.editor.deleteToPrevWordSeparator()
-      state.status = "Delete to previous word separator"
+      pad.editor.deleteToPrevWordSeparator()
+      pad.debugStatus = "Delete to previous word separator"
     of "VT": # Ctrl-K
-      state.editor.deleteToEndOfLine()
-      state.status = "Delete to end of line"
+      pad.editor.deleteToEndOfLine()
+      pad.debugStatus = "Delete to end of line"
     of "NAK": # Ctrl-U
-      state.editor.deleteToStartOfLine()
-      state.status = "Delete to start of line"
+      pad.editor.deleteToStartOfLine()
+      pad.debugStatus = "Delete to start of line"
     of "NL", "ESC\n", "ESC\r":
-      let payload = state.editor.currentText()
-      if payload.len > 0:
-        let submitted = payload.splitLines()
-        # Add to input history, avoid duplicates in a row
-        if state.inputHistory.len == 0 or state.inputHistory[^1] != payload:
-          state.inputHistory.add(payload)
-          if state.inputHistory.len > 500:
-            state.inputHistory.delete(0)
-        state.inputHistoryIndex = -1
-        # Clear editor first so redraw shows fresh prompt immediately.
-        state.editor.clearEditor()
-        state.stickyHeight = 0
-        if showInputHistory:
-          # Build history block: blank pad, each line with proper prompt/indent, blank pad.
-          var historyLines: seq[string] = @[]
-          historyLines.add("")
-          for i, ln in submitted:
-            let prefix = if i == 0: "› " else: editorIndent
-            historyLines.add(prefix & ln)
-          historyLines.add("")
-          appendEditorHistoryUnlocked(state, historyLines)
-          state.status = "Submitted text (history enabled)"
-        else:
-          appendDisplayUnlocked(state, submitted)
-          state.status = "Submitted text"
-        needsRedraw = false
-      else:
-        state.status = "Nothing to submit"
+      submitInput(pad)
+      needsRedraw = false
     of "ESC[5~": # PageUp - previous input
-      if state.inputHistory.len > 0:
-        if state.inputHistoryIndex == -1:
-          state.inputHistoryIndex = state.inputHistory.len - 1
-        elif state.inputHistoryIndex > 0:
-          dec state.inputHistoryIndex
-        state.editor.resetEditorToText(state.inputHistory[state.inputHistoryIndex])
-        state.status = "Recalled previous input"
+      pad.editor.previousInputHistory()
+      pad.debugStatus = "Recalled previous input"
     of "ESC[6~": # PageDown - next input
-      if state.inputHistory.len > 0 and state.inputHistoryIndex != -1:
-        if state.inputHistoryIndex < state.inputHistory.len - 1:
-          inc state.inputHistoryIndex
-          state.editor.resetEditorToText(state.inputHistory[state.inputHistoryIndex])
-          state.status = "Recalled next input"
-        else:
-          state.inputHistoryIndex = -1
-          state.editor.clearEditor()
-          state.status = "Input cleared"
+      pad.editor.nextInputHistory()
+      if pad.editor.inputHistoryIndex == -1:
+        pad.debugStatus = "Input cleared"
+      else:
+        pad.debugStatus = "Recalled next input"
     of "ESC[H", "SOH":
-      state.editor.moveHome()
-      state.status = "Home"
+      pad.editor.moveHome()
+      pad.debugStatus = "Home"
     of "ESC[F", "ENQ":
-      state.editor.moveEnd()
-      state.status = "End"
+      pad.editor.moveEnd()
+      pad.debugStatus = "End"
     of "ESC[A":
-      state.editor.moveUp()
-      state.status = "Cursor up"
+      pad.editor.moveUp()
+      pad.debugStatus = "Cursor up"
     of "ESC[B":
-      state.editor.moveDown()
-      state.status = "Cursor down"
+      pad.editor.moveDown()
+      pad.debugStatus = "Cursor down"
     of "ESC[D":
-      state.editor.moveLeft()
-      state.status = "Cursor left"
+      pad.editor.moveLeft()
+      pad.debugStatus = "Cursor left"
     of "ESC[C":
-      state.editor.moveRight()
-      state.status = "Cursor right"
+      pad.editor.moveRight()
+      pad.debugStatus = "Cursor right"
     of "ESC[1;5D":
-      state.editor.moveLeftWord()
-      state.status = "Word left"
+      pad.editor.moveLeftWord()
+      pad.debugStatus = "Word left"
     of "ESC[1;5C":
-      state.editor.moveRightWord()
-      state.status = "Word right"
+      pad.editor.moveRightWord()
+      pad.debugStatus = "Word right"
     else:
       if key.len == 1:
-        state.editor.insertText(key)
-        state.status = "Typing"
+        pad.editor.insertText(key)
+        pad.debugStatus = "Typing"
       else:
-        state.status = "Unhandled: " & key
+        pad.debugStatus = "Unhandled: " & key
     if needsRedraw:
-      drawBottomUnlocked(state, false)
+      drawBottomUnlocked(pad, false)
   finally:
     releaseSpin(termLock)
 
+# the keyLoop thread processes keyboard input
 proc keyLoop() {.thread.} =
   while running.load():
     let keys = getKey()
@@ -625,55 +680,33 @@ proc keyLoop() {.thread.} =
     if keys.len == 0:
       sleep(keyPollIntervalMs)
 
-proc sampleFeedLoop() {.thread.} =
-  var counter = 1
-  while running.load():
-    var remaining = feedIntervalMs
-    while remaining > 0 and running.load():
-      let chunk = min(feedSleepSliceMs, remaining)
-      sleep(chunk.int)
-      remaining -= chunk
-    if not running.load():
-      break
-    if not running.load():
-      break
-    let timeStamp = now().format("HH:mm:ss")
-    let line = &"({timeStamp}) background event #{counter}"
-    inc counter
-    postEvent(UiEvent(kind: evAppend, lines: @[line]))
 
-proc mainLoop() =
-  var state = UiState(
-    width: terminalWidth(),
-    height: terminalHeight(),
-    status: "Ready",
-    editor: initEditor(),
-    bottomHeight: 4,
-    running: true,
-    stickyHeight: 4
-  )
-  drawBottom(state)
+proc mainLoop(pad: var Scrollpad) =
+  drawBottom(pad)
 
   var resizeTicker = epochTime()
-  while state.running:
+  # drain all pending events before quitting
+  while true:
     var event: UiEvent
     if tryPopEvent(event):
       case event.kind
       of evKey:
-        handleKey(state, event.key)
+        handleKey(pad, event.key)
       of evAppend:
-        appendDisplay(state, event.lines)
+        appendDisplay(pad, event.lines)
       of evStatus:
-        state.status = event.status
-        drawBottom(state)
+        pad.status = event.status
+        drawBottom(pad)
+    elif not running.load():
+      break
     else:
       let nowTime = epochTime()
       if (nowTime - resizeTicker) * 1000 >= resizePollIntervalMs.float:
         resizeTicker = nowTime
         let currentW = terminalWidth()
         let currentH = terminalHeight()
-        if currentW != state.width or currentH != state.height:
-          drawBottom(state)
+        if currentW != pad.width or currentH != pad.height:
+          drawBottom(pad)
       sleep(10)
 
 proc shutdown(termWasRaw: bool) =
@@ -686,22 +719,114 @@ proc shutdown(termWasRaw: bool) =
     setCursorPos(0, baseRow)
     disable_raw_mode()
   stdout.write(ansiReset)
+  stdout.write(fillToEOL)
   stdout.flushFile()
 
-when isMainModule:
-  initSpinLock(termLock)
-  eventCh.open()
+proc newScrollpad(): Scrollpad =
+  result.width = terminalWidth()
+  result.height = terminalHeight()
+  result.status = ""
+  result.debugStatus = ""
+  result.editor = initEditor()
+  result.bottomHeight = 4
+  result.stickyHeight = 4
+  result.submitCallback = nil
+
+proc print*(items: varargs[string, `$`]) =
+  ## Format arguments similar to Nim's echo and post them to the UI via postEvent.
+  var parts: seq[string] = @[]
+  for i in items:
+    # Use $ to stringify values similar to echo
+    parts.add($i)
+  let line = parts.join(" ")
+  postEvent(UiEvent(kind: evAppend, lines: @[line]))
+
+proc printError*(items: varargs[string, `$`]) =
+  ## print to pad, similar to echo
+  var parts: seq[string] = @[]
+  for i in items:
+    parts.add($i)
+  let line = errorColorSeq & parts.join(" ")
+  postEvent(UiEvent(kind: evAppend, lines: @[line]))
+
+proc setInputCallback*(cb: SubmitCallback) =
+  ## Register an input handler
+  pad.submitCallback = cb
+
+proc runScrollpad*() =
+  ## Start the Scrollpad & input thread, etc.  Call stopScrollpad() to stop it
   running.store(true)
   var rawEnabled = false
   enable_raw_mode()
   rawEnabled = true
-  var keyThread, feedThread: Thread[void]
+  var keyThread: Thread[void]
   createThread(keyThread, keyLoop)
-  createThread(feedThread, sampleFeedLoop)
   try:
-    mainLoop()
+    mainLoop(pad)
   finally:
     running.store(false)
     joinThread(keyThread)
-    joinThread(feedThread)
     shutdown(rawEnabled)
+
+proc isScrollpadRunning*(): bool =
+  ## check if scrollpad is still in a running state
+  running.load()
+
+proc stopScrollpad*() =
+  ## stop scrollpad execution and return from runScrollpad()
+  running.store(false)
+
+proc setScrollpadStatusBar*(status: string) =
+  ## set the string shown in the statusBar
+  pad.status = status
+
+proc getScrollpadWidth*(): int =
+  ## return the width of the scrollpad (terminal width)
+  pad.width
+
+proc getScrollpadHeight*(): int =
+  ## return the height of the scrollpad (terminal height)
+  pad.height
+
+# Initialize spin locks and create the main scrollpad
+initSpinLock(termLock)
+pad = newScrollpad()
+pad.debugStatus = "Scrollpad TUI - Press ESC to exit"
+eventCh.open()
+
+when isMainModule:
+  import strformat
+  const
+    feedIntervalMs = 800
+    feedSleepSliceMs = 40
+  proc sampleFeedLoop() {.thread.} =
+    var counter = 1
+    while isScrollpadRunning():
+      var remaining = feedIntervalMs
+      while remaining > 0 and isScrollpadRunning():
+        let chunk = min(feedSleepSliceMs, remaining)
+        sleep(chunk.int)
+        remaining -= chunk
+      if not isScrollpadRunning():
+        break
+      let timeStamp = now().format("HH:mm:ss")
+      let line = &"({timeStamp}) background event #{counter}"
+      inc counter
+      print(line)
+
+  #showInputHistory = false
+  setInputCallback(proc(text: string) {.nimcall.} =
+    if text == "/quit":
+      print "See you later, alligator!"
+      running.store(false)
+      return
+    setScrollpadStatusBar("You submitted some text...")
+    print "Hi there!  You submitted:", text
+    printError "This is an error message."
+  )
+  var t: Thread[void]
+  createThread(t, sampleFeedLoop)
+  try:
+    runScrollpad()
+  finally:
+    joinThread(t)
