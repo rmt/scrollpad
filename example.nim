@@ -1,44 +1,36 @@
-import std/[times, os, strformat]
-import scrollpad
+import std/[asyncdispatch, times, os, strformat]
+from scrollpad import print, printError
 
 when isMainModule:
-  const
-    feedIntervalMs = 800
-    feedSleepSliceMs = 40
-  proc sampleFeedLoop() {.thread.} =
+  proc generateEvents(until: int = 7) {.async.} =
     var counter = 1
-    while isScrollpadRunning():
-      var remaining = feedIntervalMs
-      while remaining > 0 and isScrollpadRunning():
-        let chunk = min(feedSleepSliceMs, remaining)
-        sleep(chunk.int)
-        remaining -= chunk
-      if not isScrollpadRunning():
-        break
+    await sleepAsync(1)
+    while counter <= until and scrollpad.isScrollpadRunning():
+      await sleepAsync(1000)
       let timeStamp = now().format("HH:mm:ss")
       let line = &"({timeStamp}) background event #{counter}"
       inc counter
-      print(line)
+      print line
 
-  showInputHistory = false
-  shouldEscapeStop = false
-  editorPrompt = ">>> "
-  editorPrompt2 = "... "
-  editorPromptLen = editorPrompt.len
-  setInputCallback(proc(text: string) {.nimcall.} =
+  scrollpad.showInputHistory = false
+  scrollpad.shouldEscapeStop = false
+  scrollpad.editorPrompt = ">>> "
+  scrollpad.editorPrompt2 = "... "
+  scrollpad.editorPromptLen = len(scrollpad.editorPrompt)
+
+  scrollpad.setInputCallback(proc(text: string) {.nimcall.} =
     if text == "/quit":
       print "See you later, alligator!"
-      stopScrollpad()
+      scrollpad.stopScrollpad()
       return
-    setScrollpadStatusBar("Type /quit to quit.")
-    print "Hi there!  You submitted:", text
+    if text == "/events":
+      asyncCheck generateEvents(7)
+      return
+    scrollpad.setScrollpadStatusBar("Type /quit to quit, or /events to start an async loop")
     printError ""
-    printError "This is an error message."
+    printError "Unknown command:", text
     printError ""
   )
-  var t: Thread[void]
-  createThread(t, sampleFeedLoop)
-  try:
-    runScrollpad()
-  finally:
-    joinThread(t)
+
+  asyncCheck generateEvents(5)
+  waitFor scrollpad.runScrollpad()
